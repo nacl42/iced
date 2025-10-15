@@ -605,8 +605,9 @@ fn parse_with<'a>(
             pulldown_cmark::Tag::Link { dest_url, .. } if !metadata => {
                 match Url::parse(&dest_url) {
                     Ok(url)
-                        if url.scheme() == "http"
-                            || url.scheme() == "https" =>
+                        //if url.scheme() == "http"
+                        //    || url.scheme() == "https"
+                        =>
                     {
                         link = Some(url);
                     }
