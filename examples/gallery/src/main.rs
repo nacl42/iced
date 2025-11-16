@@ -18,7 +18,7 @@ use iced::{
     Subscription, Task, Theme, color,
 };
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 fn main() -> iced::Result {
     iced::application::timed(
@@ -35,8 +35,6 @@ fn main() -> iced::Result {
 struct Gallery {
     images: Vec<Image>,
     previews: HashMap<Id, Preview>,
-    visible: HashSet<Id>,
-    downloaded: HashSet<Id>,
     viewer: Viewer,
     now: Instant,
 }
@@ -45,7 +43,6 @@ struct Gallery {
 enum Message {
     ImagesListed(Result<Vec<Image>, Error>),
     ImagePoppedIn(Id),
-    ImagePoppedOut(Id),
     ImageDownloaded(Result<Rgba, Error>),
     ThumbnailDownloaded(Id, Result<Rgba, Error>),
     ThumbnailHovered(Id, bool),
@@ -61,8 +58,6 @@ impl Gallery {
             Self {
                 images: Vec::new(),
                 previews: HashMap::new(),
-                visible: HashSet::new(),
-                downloaded: HashSet::new(),
                 viewer: Viewer::new(),
                 now: Instant::now(),
             },
@@ -107,14 +102,6 @@ impl Gallery {
                     return Task::none();
                 };
 
-                let _ = self.visible.insert(id);
-
-                if self.downloaded.contains(&id) {
-                    return Task::none();
-                }
-
-                let _ = self.downloaded.insert(id);
-
                 Task::sip(
                     image.download(Size::Thumbnail {
                         width: Preview::WIDTH,
@@ -123,11 +110,6 @@ impl Gallery {
                     Message::BlurhashDecoded.with(id),
                     Message::ThumbnailDownloaded.with(id),
                 )
-            }
-            Message::ImagePoppedOut(id) => {
-                let _ = self.visible.remove(&id);
-
-                Task::none()
             }
             Message::ImageDownloaded(Ok(rgba)) => {
                 self.viewer.show(rgba, self.now);
@@ -199,17 +181,7 @@ impl Gallery {
         let images = self
             .images
             .iter()
-            .map(|image| {
-                card(
-                    image,
-                    if self.visible.contains(&image.id) {
-                        self.previews.get(&image.id)
-                    } else {
-                        None
-                    },
-                    self.now,
-                )
-            })
+            .map(|image| card(image, self.previews.get(&image.id), self.now))
             .chain((self.images.len()..=Image::LIMIT).map(|_| placeholder()));
 
         let gallery = grid(images)
@@ -276,7 +248,7 @@ fn card<'a>(
         .on_enter(Message::ThumbnailHovered(metadata.id, true))
         .on_exit(Message::ThumbnailHovered(metadata.id, false));
 
-    let card: Element<'_, _> = if let Some(preview) = preview {
+    if let Some(preview) = preview {
         let is_thumbnail = matches!(preview, Preview::Ready { .. });
 
         button(card)
@@ -285,13 +257,10 @@ fn card<'a>(
             .style(button::text)
             .into()
     } else {
-        card.into()
-    };
-
-    sensor(card)
-        .on_show(|_| Message::ImagePoppedIn(metadata.id))
-        .on_hide(Message::ImagePoppedOut(metadata.id))
-        .into()
+        sensor(card)
+            .on_show(|_| Message::ImagePoppedIn(metadata.id))
+            .into()
+    }
 }
 
 fn placeholder<'a>() -> Element<'a, Message> {

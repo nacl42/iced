@@ -11,11 +11,11 @@ mod vector;
 
 use crate::Buffer;
 use crate::core::{Rectangle, Size, Transformation};
-use crate::graphics::Shell;
 
 use bytemuck::{Pod, Zeroable};
 
 use std::mem;
+use std::sync::Arc;
 
 pub use crate::graphics::Image;
 
@@ -27,7 +27,7 @@ pub struct Pipeline {
     backend: wgpu::Backend,
     nearest_sampler: wgpu::Sampler,
     linear_sampler: wgpu::Sampler,
-    texture_layout: wgpu::BindGroupLayout,
+    texture_layout: Arc<wgpu::BindGroupLayout>,
     constant_layout: wgpu::BindGroupLayout,
 }
 
@@ -196,24 +196,13 @@ impl Pipeline {
             backend,
             nearest_sampler,
             linear_sampler,
-            texture_layout,
+            texture_layout: Arc::new(texture_layout),
             constant_layout,
         }
     }
 
-    pub fn create_cache(
-        &self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        shell: &Shell,
-    ) -> Cache {
-        Cache::new(
-            device,
-            queue,
-            self.backend,
-            self.texture_layout.clone(),
-            shell,
-        )
+    pub fn create_cache(&self, device: &wgpu::Device) -> Cache {
+        Cache::new(device, self.backend, self.texture_layout.clone())
     }
 }
 
@@ -239,50 +228,16 @@ impl State {
         transformation: Transformation,
         scale: f32,
     ) {
-        if self.layers.len() <= self.prepare_layer {
-            self.layers.push(Layer::new(
-                device,
-                &pipeline.constant_layout,
-                &pipeline.nearest_sampler,
-                &pipeline.linear_sampler,
-            ));
-        }
-
-        let layer = &mut self.layers[self.prepare_layer];
-        layer.prepare(device, encoder, belt, transformation, scale);
-
-        let mut atlas = None;
-        let nearest_instances = &mut Vec::new();
-        let linear_instances = &mut Vec::new();
+        let nearest_instances: &mut Vec<Instance> = &mut Vec::new();
+        let linear_instances: &mut Vec<Instance> = &mut Vec::new();
 
         for image in images {
             match &image {
                 #[cfg(feature = "image")]
                 Image::Raster(image, bounds) => {
-                    if let Some((atlas_entry, bind_group)) = cache
-                        .upload_raster(device, encoder, belt, &image.handle)
+                    if let Some(atlas_entry) =
+                        cache.upload_raster(device, encoder, &image.handle)
                     {
-                        match atlas.as_mut() {
-                            None => {
-                                atlas = Some(bind_group.clone());
-                            }
-                            Some(atlas) if atlas != bind_group => {
-                                layer.push(
-                                    device,
-                                    encoder,
-                                    belt,
-                                    atlas,
-                                    nearest_instances,
-                                    linear_instances,
-                                );
-
-                                *atlas = bind_group.clone();
-                                nearest_instances.clear();
-                                linear_instances.clear();
-                            }
-                            _ => {}
-                        }
-
                         add_instances(
                             [bounds.x, bounds.y],
                             [bounds.width, bounds.height],
@@ -302,44 +257,20 @@ impl State {
                     }
                 }
                 #[cfg(not(feature = "image"))]
-                Image::Raster { .. } => continue,
+                Image::Raster { .. } => {}
 
                 #[cfg(feature = "svg")]
                 Image::Vector(svg, bounds) => {
                     let size = [bounds.width, bounds.height];
 
-                    if let Some((atlas_entry, bind_group)) = cache
-                        .upload_vector(
-                            device,
-                            encoder,
-                            belt,
-                            &svg.handle,
-                            svg.color,
-                            size,
-                            scale,
-                        )
-                    {
-                        match atlas.as_mut() {
-                            None => {
-                                atlas = Some(bind_group.clone());
-                            }
-                            Some(atlas) if atlas != bind_group => {
-                                layer.push(
-                                    device,
-                                    encoder,
-                                    belt,
-                                    atlas,
-                                    nearest_instances,
-                                    linear_instances,
-                                );
-
-                                *atlas = bind_group.clone();
-                                nearest_instances.clear();
-                                linear_instances.clear();
-                            }
-                            _ => {}
-                        }
-
+                    if let Some(atlas_entry) = cache.upload_vector(
+                        device,
+                        encoder,
+                        &svg.handle,
+                        svg.color,
+                        size,
+                        scale,
+                    ) {
                         add_instances(
                             [bounds.x, bounds.y],
                             size,
@@ -352,20 +283,34 @@ impl State {
                     }
                 }
                 #[cfg(not(feature = "svg"))]
-                Image::Vector { .. } => continue,
+                Image::Vector { .. } => {}
             }
         }
 
-        if !nearest_instances.is_empty() || !linear_instances.is_empty() {
-            layer.push(
-                device,
-                encoder,
-                belt,
-                &atlas.expect("atlas should be defined"),
-                nearest_instances,
-                linear_instances,
-            );
+        if nearest_instances.is_empty() && linear_instances.is_empty() {
+            return;
         }
+
+        if self.layers.len() <= self.prepare_layer {
+            self.layers.push(Layer::new(
+                device,
+                &pipeline.constant_layout,
+                &pipeline.nearest_sampler,
+                &pipeline.linear_sampler,
+            ));
+        }
+
+        let layer = &mut self.layers[self.prepare_layer];
+
+        layer.prepare(
+            device,
+            encoder,
+            belt,
+            nearest_instances,
+            linear_instances,
+            transformation,
+            scale,
+        );
 
         self.prepare_layer += 1;
     }
@@ -373,6 +318,7 @@ impl State {
     pub fn render<'a>(
         &'a self,
         pipeline: &'a Pipeline,
+        cache: &'a Cache,
         layer: usize,
         bounds: Rectangle<u32>,
         render_pass: &mut wgpu::RenderPass<'a>,
@@ -387,15 +333,13 @@ impl State {
                 bounds.height,
             );
 
+            render_pass.set_bind_group(1, cache.bind_group(), &[]);
+
             layer.render(render_pass);
         }
     }
 
     pub fn trim(&mut self) {
-        for layer in &mut self.layers[..self.prepare_layer] {
-            layer.clear();
-        }
-
         self.prepare_layer = 0;
     }
 }
@@ -403,18 +347,8 @@ impl State {
 #[derive(Debug)]
 struct Layer {
     uniforms: wgpu::Buffer,
-    instances: Buffer<Instance>,
-    total: usize,
-    nearest: Vec<Group>,
-    nearest_layout: wgpu::BindGroup,
-    linear: Vec<Group>,
-    linear_layout: wgpu::BindGroup,
-}
-
-#[derive(Debug)]
-struct Group {
-    atlas: wgpu::BindGroup,
-    instance_count: usize,
+    nearest: Data,
+    linear: Data,
 }
 
 impl Layer {
@@ -431,69 +365,16 @@ impl Layer {
             mapped_at_creation: false,
         });
 
-        let instances = Buffer::new(
-            device,
-            "iced_wgpu::image instance buffer",
-            Instance::INITIAL,
-            wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-        );
+        let nearest =
+            Data::new(device, constant_layout, nearest_sampler, &uniforms);
 
-        let nearest_layout =
-            device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("iced_wgpu::image constants bind group"),
-                layout: constant_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::Buffer(
-                            wgpu::BufferBinding {
-                                buffer: &uniforms,
-                                offset: 0,
-                                size: None,
-                            },
-                        ),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(
-                            nearest_sampler,
-                        ),
-                    },
-                ],
-            });
-
-        let linear_layout =
-            device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("iced_wgpu::image constants bind group"),
-                layout: constant_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::Buffer(
-                            wgpu::BufferBinding {
-                                buffer: &uniforms,
-                                offset: 0,
-                                size: None,
-                            },
-                        ),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(
-                            linear_sampler,
-                        ),
-                    },
-                ],
-            });
+        let linear =
+            Data::new(device, constant_layout, linear_sampler, &uniforms);
 
         Self {
             uniforms,
-            instances,
-            total: 0,
-            nearest: Vec::new(),
-            nearest_layout,
-            linear: Vec::new(),
-            linear_layout,
+            nearest,
+            linear,
         }
     }
 
@@ -502,6 +383,8 @@ impl Layer {
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
         belt: &mut wgpu::util::StagingBelt,
+        nearest_instances: &[Instance],
+        linear_instances: &[Instance],
         transformation: Transformation,
         scale_factor: f32,
     ) {
@@ -521,79 +404,94 @@ impl Layer {
             device,
         )
         .copy_from_slice(bytes);
+
+        self.nearest
+            .upload(device, encoder, belt, nearest_instances);
+
+        self.linear.upload(device, encoder, belt, linear_instances);
     }
 
-    fn push(
+    fn render<'a>(&'a self, render_pass: &mut wgpu::RenderPass<'a>) {
+        self.nearest.render(render_pass);
+        self.linear.render(render_pass);
+    }
+}
+
+#[derive(Debug)]
+struct Data {
+    constants: wgpu::BindGroup,
+    instances: Buffer<Instance>,
+    instance_count: usize,
+}
+
+impl Data {
+    pub fn new(
+        device: &wgpu::Device,
+        constant_layout: &wgpu::BindGroupLayout,
+        sampler: &wgpu::Sampler,
+        uniforms: &wgpu::Buffer,
+    ) -> Self {
+        let constants = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("iced_wgpu::image constants bind group"),
+            layout: constant_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(
+                        wgpu::BufferBinding {
+                            buffer: uniforms,
+                            offset: 0,
+                            size: None,
+                        },
+                    ),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(sampler),
+                },
+            ],
+        });
+
+        let instances = Buffer::new(
+            device,
+            "iced_wgpu::image instance buffer",
+            Instance::INITIAL,
+            wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        );
+
+        Self {
+            constants,
+            instances,
+            instance_count: 0,
+        }
+    }
+
+    fn upload(
         &mut self,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
         belt: &mut wgpu::util::StagingBelt,
-        atlas: &wgpu::BindGroup,
-        nearest: &[Instance],
-        linear: &[Instance],
+        instances: &[Instance],
     ) {
-        let new = nearest.len() + linear.len();
+        self.instance_count = instances.len();
 
-        let _ = self.instances.resize(device, self.total + new);
-
-        if !nearest.is_empty() {
-            self.total += self
-                .instances
-                .write(device, encoder, belt, self.total, nearest);
-
-            self.nearest.push(Group {
-                atlas: atlas.clone(),
-                instance_count: nearest.len(),
-            });
+        if self.instance_count == 0 {
+            return;
         }
 
-        if !linear.is_empty() {
-            self.total += self
-                .instances
-                .write(device, encoder, belt, self.total, linear);
-
-            self.linear.push(Group {
-                atlas: atlas.clone(),
-                instance_count: linear.len(),
-            });
-        }
+        let _ = self.instances.resize(device, instances.len());
+        let _ = self.instances.write(device, encoder, belt, 0, instances);
     }
 
     fn render<'a>(&'a self, render_pass: &mut wgpu::RenderPass<'a>) {
+        if self.instance_count == 0 {
+            return;
+        }
+
+        render_pass.set_bind_group(0, &self.constants, &[]);
         render_pass.set_vertex_buffer(0, self.instances.slice(..));
 
-        let mut offset = 0;
-
-        if !self.nearest.is_empty() {
-            render_pass.set_bind_group(0, &self.nearest_layout, &[]);
-
-            for group in &self.nearest {
-                render_pass.set_bind_group(1, &group.atlas, &[]);
-                render_pass
-                    .draw(0..6, offset..offset + group.instance_count as u32);
-
-                offset += group.instance_count as u32;
-            }
-        }
-
-        if !self.linear.is_empty() {
-            render_pass.set_bind_group(0, &self.linear_layout, &[]);
-
-            for group in &self.linear {
-                render_pass.set_bind_group(1, &group.atlas, &[]);
-                render_pass
-                    .draw(0..6, offset..offset + group.instance_count as u32);
-
-                offset += group.instance_count as u32;
-            }
-        }
-    }
-
-    fn clear(&mut self) {
-        self.instances.clear();
-        self.nearest.clear();
-        self.linear.clear();
-        self.total = 0;
+        render_pass.draw(0..6, 0..self.instance_count as u32);
     }
 }
 
@@ -699,7 +597,6 @@ fn add_instance(
     let (x, y) = allocation.position();
     let Size { width, height } = allocation.size();
     let layer = allocation.layer();
-    let atlas_size = allocation.atlas_size();
 
     let instance = Instance {
         _position: position,
@@ -708,12 +605,12 @@ fn add_instance(
         _rotation: rotation,
         _opacity: opacity,
         _position_in_atlas: [
-            (x as f32 + 0.5) / atlas_size as f32,
-            (y as f32 + 0.5) / atlas_size as f32,
+            (x as f32 + 0.5) / atlas::SIZE as f32,
+            (y as f32 + 0.5) / atlas::SIZE as f32,
         ],
         _size_in_atlas: [
-            (width as f32 - 1.0) / atlas_size as f32,
-            (height as f32 - 1.0) / atlas_size as f32,
+            (width as f32 - 1.0) / atlas::SIZE as f32,
+            (height as f32 - 1.0) / atlas::SIZE as f32,
         ],
         _layer: layer as u32,
         _snap: snap as u32,

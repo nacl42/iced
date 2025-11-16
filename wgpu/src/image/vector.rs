@@ -94,7 +94,6 @@ impl Cache {
         &mut self,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
-        belt: &mut wgpu::util::StagingBelt,
         handle: &svg::Handle,
         color: Option<Color>,
         [width, height]: [f32; 2],
@@ -168,8 +167,8 @@ impl Cache {
                     });
                 }
 
-                let allocation = atlas
-                    .upload(device, encoder, belt, width, height, &rgba)?;
+                let allocation =
+                    atlas.upload(device, encoder, width, height, &rgba)?;
 
                 log::debug!("allocating {id} {width}x{height}");
 

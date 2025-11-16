@@ -4,9 +4,7 @@ use crate::futures::futures::{
     select,
     task::{Context, Poll},
 };
-use crate::graphics::shell;
 use crate::runtime::Action;
-use crate::runtime::window;
 use std::pin::Pin;
 
 /// An event loop proxy with backpressure that implements `Sink`.
@@ -134,18 +132,5 @@ impl<T: 'static> Sink<Action<T>> for Proxy<T> {
     ) -> Poll<Result<(), Self::Error>> {
         self.sender.disconnect();
         Poll::Ready(Ok(()))
-    }
-}
-
-impl<T> shell::Notifier for Proxy<T>
-where
-    T: Send,
-{
-    fn request_redraw(&self) {
-        self.send_action(Action::Window(window::Action::RedrawAll));
-    }
-
-    fn invalidate_layout(&self) {
-        self.send_action(Action::Window(window::Action::RelayoutAll));
     }
 }

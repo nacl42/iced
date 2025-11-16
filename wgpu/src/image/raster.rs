@@ -6,18 +6,13 @@ use crate::image::atlas::{self, Atlas};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
-type Image = image_rs::ImageBuffer<image_rs::Rgba<u8>, image::Bytes>;
-
 /// Entry in cache corresponding to an image handle
 #[derive(Debug)]
 pub enum Memory {
     /// Image data on host
-    Host(Image),
+    Host(image_rs::ImageBuffer<image_rs::Rgba<u8>, image::Bytes>),
     /// Storage entry
-    Device {
-        entry: atlas::Entry,
-        bind_group: Option<wgpu::BindGroup>,
-    },
+    Device(atlas::Entry),
     /// Image not found
     NotFound,
     /// Invalid image data
@@ -25,20 +20,7 @@ pub enum Memory {
 }
 
 impl Memory {
-    pub fn load(handle: &image::Handle) -> Self {
-        match graphics::image::load(handle) {
-            Ok(image) => Self::Host(image),
-            Err(error) => Self::error(error),
-        }
-    }
-
-    pub fn error(error: image_rs::error::ImageError) -> Self {
-        match error {
-            image_rs::error::ImageError::IoError(_) => Self::NotFound,
-            _ => Self::Invalid,
-        }
-    }
-
+    /// Width and height of image
     pub fn dimensions(&self) -> Size<u32> {
         match self {
             Memory::Host(image) => {
@@ -46,20 +28,14 @@ impl Memory {
 
                 Size::new(width, height)
             }
-            Memory::Device { entry, .. } => entry.size(),
+            Memory::Device(entry) => entry.size(),
             Memory::NotFound => Size::new(1, 1),
             Memory::Invalid => Size::new(1, 1),
         }
     }
-
-    pub fn host(&self) -> Option<Image> {
-        match self {
-            Memory::Host(image) => Some(image.clone()),
-            Memory::Device { .. } | Memory::NotFound | Memory::Invalid => None,
-        }
-    }
 }
 
+/// Caches image raster data
 #[derive(Debug, Default)]
 pub struct Cache {
     map: FxHashMap<image::Id, Memory>,
@@ -68,28 +44,51 @@ pub struct Cache {
 }
 
 impl Cache {
-    pub fn get_mut(&mut self, handle: &image::Handle) -> Option<&mut Memory> {
-        let _ = self.hits.insert(handle.id());
+    /// Load image
+    pub fn load(&mut self, handle: &image::Handle) -> &mut Memory {
+        if self.contains(handle) {
+            return self.get(handle).unwrap();
+        }
 
-        self.map.get_mut(&handle.id())
-    }
-
-    pub fn insert(&mut self, handle: &image::Handle, memory: Memory) {
-        let _ = self.map.insert(handle.id(), memory);
-        let _ = self.hits.insert(handle.id());
+        let memory = match graphics::image::load(handle) {
+            Ok(image) => Memory::Host(image),
+            Err(image_rs::error::ImageError::IoError(_)) => Memory::NotFound,
+            Err(_) => Memory::Invalid,
+        };
 
         self.should_trim = true;
+
+        self.insert(handle, memory);
+        self.get(handle).unwrap()
     }
 
-    pub fn contains(&self, handle: &image::Handle) -> bool {
-        self.map.contains_key(&handle.id())
-    }
-
-    pub fn trim(
+    /// Load image and upload raster data
+    pub fn upload(
         &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        handle: &image::Handle,
         atlas: &mut Atlas,
-        on_drop: impl Fn(wgpu::BindGroup),
-    ) {
+    ) -> Option<&atlas::Entry> {
+        let memory = self.load(handle);
+
+        if let Memory::Host(image) = memory {
+            let (width, height) = image.dimensions();
+
+            let entry = atlas.upload(device, encoder, width, height, image)?;
+
+            *memory = Memory::Device(entry);
+        }
+
+        if let Memory::Device(allocation) = memory {
+            Some(allocation)
+        } else {
+            None
+        }
+    }
+
+    /// Trim cache misses from cache
+    pub fn trim(&mut self, atlas: &mut Atlas) {
         // Only trim if new entries have landed in the `Cache`
         if !self.should_trim {
             return;
@@ -100,12 +99,8 @@ impl Cache {
         self.map.retain(|k, memory| {
             let retain = hits.contains(k);
 
-            if !retain && let Memory::Device { entry, bind_group } = memory {
-                if let Some(bind_group) = bind_group.take() {
-                    on_drop(bind_group);
-                } else {
-                    atlas.remove(entry);
-                }
+            if !retain && let Memory::Device(entry) = memory {
+                atlas.remove(entry);
             }
 
             retain
@@ -113,5 +108,19 @@ impl Cache {
 
         self.hits.clear();
         self.should_trim = false;
+    }
+
+    fn get(&mut self, handle: &image::Handle) -> Option<&mut Memory> {
+        let _ = self.hits.insert(handle.id());
+
+        self.map.get_mut(&handle.id())
+    }
+
+    fn insert(&mut self, handle: &image::Handle, memory: Memory) {
+        let _ = self.map.insert(handle.id(), memory);
+    }
+
+    fn contains(&self, handle: &image::Handle) -> bool {
+        self.map.contains_key(&handle.id())
     }
 }

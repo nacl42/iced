@@ -2,7 +2,7 @@
 //! surfaces.
 use crate::core::Color;
 use crate::futures::{MaybeSend, MaybeSync};
-use crate::{Error, Settings, Shell, Viewport};
+use crate::{Error, Settings, Viewport};
 
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use thiserror::Error;
@@ -21,9 +21,8 @@ pub trait Compositor: Sized {
     fn new<W: Window + Clone>(
         settings: Settings,
         compatible_window: W,
-        shell: Shell,
     ) -> impl Future<Output = Result<Self, Error>> {
-        Self::with_backend(settings, compatible_window, shell, None)
+        Self::with_backend(settings, compatible_window, None)
     }
 
     /// Creates a new [`Compositor`] with a backend preference.
@@ -33,7 +32,6 @@ pub trait Compositor: Sized {
     fn with_backend<W: Window + Clone>(
         _settings: Settings,
         _compatible_window: W,
-        _shell: Shell,
         _backend: Option<&str>,
     ) -> impl Future<Output = Result<Self, Error>>;
 
@@ -155,7 +153,6 @@ impl Compositor for () {
     async fn with_backend<W: Window + Clone>(
         _settings: Settings,
         _compatible_window: W,
-        _shell: Shell,
         _preferred_backend: Option<&str>,
     ) -> Result<Self, Error> {
         Ok(())

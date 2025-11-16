@@ -65,8 +65,8 @@ use crate::core::renderer;
 use crate::core::{
     Background, Color, Font, Pixels, Point, Rectangle, Size, Transformation,
 };
+use crate::graphics::Viewport;
 use crate::graphics::text::{Editor, Paragraph};
-use crate::graphics::{Shell, Viewport};
 
 /// A [`wgpu`] graphics renderer for [`iced`].
 ///
@@ -117,7 +117,9 @@ impl Renderer {
             image: image::State::new(),
 
             #[cfg(any(feature = "svg", feature = "image"))]
-            image_cache: std::cell::RefCell::new(engine.create_image_cache()),
+            image_cache: std::cell::RefCell::new(
+                engine.create_image_cache(&engine.device),
+            ),
 
             // TODO: Resize belt smartly (?)
             // It would be great if the `StagingBelt` API exposed methods
@@ -458,6 +460,8 @@ impl Renderer {
 
         #[cfg(any(feature = "svg", feature = "image"))]
         let mut image_layer = 0;
+        #[cfg(any(feature = "svg", feature = "image"))]
+        let image_cache = self.image_cache.borrow();
 
         let scale_factor = viewport.scale_factor();
         let physical_bounds = Rectangle::<f32>::from(Rectangle::with_size(
@@ -628,6 +632,7 @@ impl Renderer {
                 let render_span = debug::render(debug::Primitive::Image);
                 self.image.render(
                     &self.engine.image_pipeline,
+                    &image_cache,
                     image_layer,
                     scissor_rect,
                     &mut render_pass,
@@ -905,7 +910,6 @@ impl renderer::Headless for Renderer {
                 wgpu::TextureFormat::Rgba8Unorm
             },
             Some(graphics::Antialiasing::MSAAx4),
-            Shell::headless(),
         );
 
         Some(Self::new(engine, default_font, default_text_size))

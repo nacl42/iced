@@ -2,7 +2,7 @@ use crate::core::{Color, Rectangle, Size};
 use crate::graphics::compositor::{self, Information};
 use crate::graphics::damage;
 use crate::graphics::error::{self, Error};
-use crate::graphics::{self, Shell, Viewport};
+use crate::graphics::{self, Viewport};
 use crate::{Layer, Renderer, Settings};
 
 use std::collections::VecDeque;
@@ -31,7 +31,6 @@ impl crate::graphics::Compositor for Compositor {
     async fn with_backend<W: compositor::Window>(
         settings: graphics::Settings,
         compatible_window: W,
-        _shell: Shell,
         backend: Option<&str>,
     ) -> Result<Self, Error> {
         match backend {
